@@ -19,6 +19,11 @@ from composer.metrics.nlp import LanguageCrossEntropy, Perplexity
 from composer.models.base import ComposerModel
 from omegaconf import DictConfig
 
+try:
+    import transformer_engine.pytorch as te
+    te_installed = True
+except ImportError:
+    te_installed = False
 
 class TorchCausalAttention(nn.Module):
 
@@ -66,7 +71,7 @@ class TorchCausalAttention(nn.Module):
         # 2. This is is the exact opposite behavior of Huggingface's tokenizers, which use the convention that True denotes tokens
         #   we do want to attend to. See https://huggingface.co/docs/transformers/glossary#attention-mask
         attn_mask.fill_(float('-inf'))
-        attn_mask.triu_(diagonal=1)
+        attn_mask.masked_fill_(attn_mask.to(bool).fill_(1).tril_(), 0.)
 
         if alibi:
             device, dtype = attn_mask.device, attn_mask.dtype
@@ -205,13 +210,22 @@ class GPTMLP(nn.Module):
 
     def __init__(self, cfg: DictConfig, device: Optional[str] = None):
         super().__init__()
-        self.mlp_up = nn.Linear(cfg.d_model,
-                                cfg.mlp_ratio * cfg.d_model,
-                                device=device)
+
+        if te_installed and cfg.get('te_config') and cfg.get('te_config')['linear_only']:
+            # init device is currently not supported with TransformerEngine
+            self.mlp_up = te.Linear(cfg.d_model,
+                                    cfg.mlp_ratio * cfg.d_model).to(device='cpu')
+            self.mlp_down = te.Linear(cfg.mlp_ratio * cfg.d_model,
+                                      cfg.d_model).to(device='cpu')
+        else:
+            self.mlp_up = nn.Linear(cfg.d_model,
+                                    cfg.mlp_ratio * cfg.d_model,
+                                    device=device)
+            self.mlp_down = nn.Linear(cfg.mlp_ratio * cfg.d_model,
+                                      cfg.d_model,
+                                      device=device)
+            
         self.mlp_act = nn.GELU(approximate='none')
-        self.mlp_down = nn.Linear(cfg.mlp_ratio * cfg.d_model,
-                                  cfg.d_model,
-                                  device=device)
         self.mlp_down._is_residual = True  # type: ignore
 
     def forward(self, x):
@@ -255,6 +269,7 @@ class MosaicGPT(nn.Module):
         super().__init__()
         assert cfg.name == 'mosaic_gpt', f'Tried to build MosaicGPT model with cfg.name={cfg.name}'
         self.cfg = cfg
+        self.use_te = False
         if cfg.attn_impl == 'torch':
             self.causal_attn_cls = TorchCausalAttention
         elif cfg.attn_impl == 'flash':
@@ -286,14 +301,28 @@ class MosaicGPT(nn.Module):
                                  device=cfg.init_device)
             })
         self.transformer.update({'emb_drop': nn.Dropout(cfg.emb_pdrop)})
+        if te_installed and cfg.get('te_config') and cfg.get('te_config')['linear_only'] == False:
+            layers = nn.ModuleList([
+                te.TransformerLayer(
+                        hidden_size=cfg.d_model,
+                        ffn_hidden_size=cfg.mlp_ratio * cfg.d_model,
+                        num_attention_heads=cfg.n_heads,
+                        layernorm_epsilon=1e-5,
+                        attention_dropout=cfg.attn_pdrop,
+                        hidden_dropout=cfg.resid_pdrop,
+                        fuse_qkv_params=True).to(device='cpu') for _ in range(cfg.n_layers)
+            ])
+            self.use_te = True
+        else:
+            layers = nn.ModuleList([
+                GPTBlock(cfg,
+                         causal_attn_cls=self.causal_attn_cls,
+                         device=cfg.init_device)
+                for _ in range(cfg.n_layers)
+            ])
+
         self.transformer.update({
-            'blocks':
-                nn.ModuleList([
-                    GPTBlock(cfg,
-                             causal_attn_cls=self.causal_attn_cls,
-                             device=cfg.init_device)
-                    for _ in range(cfg.n_layers)
-                ])
+            'blocks': layers
         })
         self.transformer.update(
             {'ln_f': nn.LayerNorm(cfg.d_model, device=cfg.init_device)})
@@ -421,6 +450,8 @@ class MosaicGPT(nn.Module):
                                     seq_len=S,
                                     key_padding_mask=key_padding_mask,
                                     dtype=x.dtype)
+        if self.use_te:
+            attn_mask = attn_mask.to(dtype=torch.bool)
         if self.cfg.attn_impl == 'flash' and key_padding_mask is None:
             # HazyResearch FlashMHA appears to use more memory when `key_padding_mask=None`
             # in certain settings like MosaicGPT-7B. So we always provide a tensor.
@@ -430,8 +461,16 @@ class MosaicGPT(nn.Module):
             mod_key_padding_mask = None
         else:
             mod_key_padding_mask = key_padding_mask
-        for block in self.transformer.blocks:  # type: ignore
-            x = block(x, mod_key_padding_mask, attn_mask)
+        if self.use_te:
+            # Transformer engine expects inputs in [seq_len, batch_size, hidden_size]
+            # format and currently doesn't work if the input is not contiguous
+            x = x.permute((1, 0, 2)).contiguous()
+            for block in self.transformer.blocks:  # type: ignore
+                x = block(x, attn_mask)
+            x = x.permute((1, 0, 2)).contiguous()
+        else:
+            for block in self.transformer.blocks:  # type: ignore
+                x = block(x, mod_key_padding_mask, attn_mask)
         x = self.transformer.ln_f(x)  # type: ignore
         # output embedding weight tied to input embedding
         assert isinstance(self.transformer.wte, nn.Module)  # pyright
