@@ -9,18 +9,31 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 
+try:
+    import transformer_engine.pytorch as te
+    te_installed = True
+except ImportError:
+    te_installed = False
 
 class GPTMLP(nn.Module):
 
     def __init__(self, cfg: DictConfig, device: Optional[str] = None):
         super().__init__()
-        self.mlp_up = nn.Linear(cfg.d_model,
-                                cfg.mlp_ratio * cfg.d_model,
-                                device=device)
+
+        if te_installed and cfg.get('te_config') and cfg.get('te_config')['linear_only']:
+            # init device is currently not supported with TransformerEngine
+            self.mlp_up = te.Linear(cfg.d_model,
+                                    cfg.mlp_ratio * cfg.d_model).to(device='cpu')
+            self.mlp_down = te.Linear(cfg.mlp_ratio * cfg.d_model,
+                                      cfg.d_model).to(device='cpu')
+        else:
+            self.mlp_up = nn.Linear(cfg.d_model,
+                                    cfg.mlp_ratio * cfg.d_model,
+                                    device=device)
+            self.mlp_down = nn.Linear(cfg.mlp_ratio * cfg.d_model,
+                                      cfg.d_model,
+                                      device=device)
         self.mlp_act = nn.GELU(approximate='none')
-        self.mlp_down = nn.Linear(cfg.mlp_ratio * cfg.d_model,
-                                  cfg.d_model,
-                                  device=device)
         self.mlp_down._is_residual = True  # type: ignore
 
     def forward(self, x):
